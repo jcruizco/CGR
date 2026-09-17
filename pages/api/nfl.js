@@ -66,27 +66,36 @@ async function getStandings() {
   return data;
 }
 
-async function getScoreboard(dateFromYMD, dateToYMD) {
-  const cacheKey = `${dateFromYMD}_${dateToYMD}`;
+// ESPN's date-range query (dates=FROM-TO) started failing with a generic
+// 400 "Failed to get events endpoint." We fetch one day at a time instead
+// and merge — same data, just one call per date.
+async function getScoreboardForDays(dayYMDs) {
+  const cacheKey = dayYMDs.join("_");
   if (scoreboardCache.key === cacheKey && Date.now() - scoreboardCache.timestamp < SCOREBOARD_TTL_MS) {
     return scoreboardCache.data;
   }
-  const data = await fetchJSON(
-    `https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=${dateFromYMD}-${dateToYMD}`
-  );
-  scoreboardCache = { key: cacheKey, data, timestamp: Date.now() };
-  return data;
+  const allEvents = [];
+  for (const ymd of dayYMDs) {
+    try {
+      const data = await fetchJSON(`https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates=${ymd}`);
+      allEvents.push(...(data.events || []));
+    } catch (e) {
+      // one bad day shouldn't kill the whole week
+    }
+  }
+  scoreboardCache = { key: cacheKey, data: allEvents, timestamp: Date.now() };
+  return allEvents;
 }
 
 export default async function handler(req, res) {
   const errors = [];
-  const today = new Date();
-  const in7Days = new Date();
-  in7Days.setDate(today.getDate() + 7);
   const toYMD = (d) => d.toISOString().split("T")[0].replace(/-/g, "");
-
-  const dateFrom = toYMD(today);
-  const dateTo = toYMD(in7Days);
+  const dayYMDs = [];
+  for (let i = 0; i <= 7; i++) {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    dayYMDs.push(toYMD(d));
+  }
 
   let statsIndex = {};
   try {
@@ -98,8 +107,10 @@ export default async function handler(req, res) {
 
   let events = [];
   try {
-    const scoreboardData = await getScoreboard(dateFrom, dateTo);
-    events = scoreboardData.events || [];
+    events = await getScoreboardForDays(dayYMDs);
+    // de-duplicate in case a game appears on more than one day's response
+    const seen = new Set();
+    events = events.filter((ev) => (seen.has(ev.id) ? false : (seen.add(ev.id), true)));
   } catch (e) {
     errors.push(`Scoreboard NFL: ${e.message}`);
   }
