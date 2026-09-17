@@ -1,6 +1,11 @@
 // This code runs on the server (never in the user's browser), so the API
 // key stays hidden. The frontend calls /api/fixtures instead of calling
 // football-data.org directly.
+//
+// football-data.org's free tier allows very few requests per minute, so we
+// cache the combined result in memory for a few minutes. Repeated page
+// visits within that window are served from cache instead of hitting the
+// API again.
 
 const COMPETITIONS = [
   { code: "CL", name: "Champions League" },
@@ -10,6 +15,9 @@ const COMPETITIONS = [
   { code: "SA", name: "Serie A" },
 ];
 
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let cache = { key: null, data: null, timestamp: 0 };
+
 export default async function handler(req, res) {
   const apiKey = process.env.FOOTBALL_DATA_KEY;
 
@@ -17,8 +25,6 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Falta configurar FOOTBALL_DATA_KEY en las variables de entorno." });
   }
 
-  // Default window: today through 2 days ahead (3 days total).
-  // Can be overridden with ?dateFrom=&dateTo=
   const today = new Date();
   const in2Days = new Date();
   in2Days.setDate(today.getDate() + 2);
@@ -26,10 +32,14 @@ export default async function handler(req, res) {
 
   const dateFrom = req.query.dateFrom || toISODate(today);
   const dateTo = req.query.dateTo || toISODate(in2Days);
+  const cacheKey = `${dateFrom}_${dateTo}`;
+
+  const isCacheFresh = cache.key === cacheKey && Date.now() - cache.timestamp < CACHE_TTL_MS;
+  if (isCacheFresh) {
+    return res.status(200).json({ ...cache.data, cached: true });
+  }
 
   try {
-    // football-data.org's free tier is rate-limited, so we fetch the
-    // competitions one at a time instead of all in parallel.
     const allMatches = [];
     const errors = [];
 
@@ -60,7 +70,15 @@ export default async function handler(req, res) {
 
     allMatches.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
 
-    res.status(200).json({ matches: allMatches, errors: errors.length ? errors : undefined });
+    const result = { matches: allMatches, errors: errors.length ? errors : undefined };
+
+    // Only cache a fully-successful response, so a rate-limited attempt
+    // doesn't get "stuck" as the cached result for the next 5 minutes.
+    if (errors.length === 0) {
+      cache = { key: cacheKey, data: result, timestamp: Date.now() };
+    }
+
+    res.status(200).json(result);
   } catch (err) {
     res.status(500).json({ error: `No se pudo contactar football-data.org: ${err.message}` });
   }
