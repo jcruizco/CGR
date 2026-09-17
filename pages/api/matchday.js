@@ -1,4 +1,4 @@
-import { buildStatsIndex, getTeamVenueStats, buildMarkets } from "../../lib/picks";
+import { buildStatsIndex, getTeamVenueStats, buildMarkets, computeForm } from "../../lib/picks";
 
 const COMPETITIONS = [
   { code: "CL", name: "Champions League" },
@@ -8,10 +8,11 @@ const COMPETITIONS = [
   { code: "SA", name: "Serie A" },
 ];
 
-const FIXTURES_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const RAW_MATCHES_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const STANDINGS_TTL_MS = 30 * 60 * 1000; // 30 minutes — changes slowly
+const FORM_LOOKBACK_DAYS = 45; // how far back we pull to compute recent form
 
-let fixturesCache = { key: null, data: null, timestamp: 0 };
+let rawMatchesCache = {}; // { [competitionCode]: { data, timestamp } }
 let standingsCache = {}; // { [competitionCode]: { data, timestamp } }
 
 async function fetchJSON(url, apiKey) {
@@ -21,6 +22,27 @@ async function fetchJSON(url, apiKey) {
     throw new Error(text);
   }
   return response.json();
+}
+
+// One call per competition, covering FORM_LOOKBACK_DAYS in the past through
+// the requested upcoming window. Reused both for the fixtures we display
+// AND for computing recent form — no extra API calls needed.
+async function getRawMatches(code, dateTo, apiKey) {
+  const cached = rawMatchesCache[code];
+  if (cached && Date.now() - cached.timestamp < RAW_MATCHES_TTL_MS) {
+    return cached.data;
+  }
+  const dateFrom = new Date();
+  dateFrom.setDate(dateFrom.getDate() - FORM_LOOKBACK_DAYS);
+  const dateFromISO = dateFrom.toISOString().split("T")[0];
+
+  const data = await fetchJSON(
+    `https://api.football-data.org/v4/competitions/${code}/matches?dateFrom=${dateFromISO}&dateTo=${dateTo}`,
+    apiKey
+  );
+  const matches = data.matches || [];
+  rawMatchesCache[code] = { data: matches, timestamp: Date.now() };
+  return matches;
 }
 
 async function getStandings(code, apiKey) {
@@ -45,70 +67,69 @@ export default async function handler(req, res) {
   const toISODate = (d) => d.toISOString().split("T")[0];
   const dateFrom = req.query.dateFrom || toISODate(today);
   const dateTo = req.query.dateTo || toISODate(in2Days);
-  const cacheKey = `${dateFrom}_${dateTo}`;
 
   const errors = [];
-  let matches = [];
+  const enriched = [];
 
-  const isFixturesCacheFresh = fixturesCache.key === cacheKey && Date.now() - fixturesCache.timestamp < FIXTURES_TTL_MS;
-  if (isFixturesCacheFresh) {
-    matches = fixturesCache.data;
-  } else {
-    for (const comp of COMPETITIONS) {
-      try {
-        const data = await fetchJSON(
-          `https://api.football-data.org/v4/competitions/${comp.code}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}`,
-          apiKey
-        );
-        const compMatches = (data.matches || []).map((m) => ({
-          id: m.id,
-          competitionCode: comp.code,
-          competition: comp.name,
-          utcDate: m.utcDate,
-          status: m.status,
-          home: m.homeTeam.name,
-          away: m.awayTeam.name,
-          homeId: m.homeTeam.id,
-          awayId: m.awayTeam.id,
-          score: m.score.fullTime,
-        }));
-        matches.push(...compMatches);
-      } catch (e) {
-        errors.push(`Partidos ${comp.name}: ${e.message}`);
-      }
-    }
-    matches.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
-    if (errors.length === 0) {
-      fixturesCache = { key: cacheKey, data: matches, timestamp: Date.now() };
-    }
-  }
-
-  // Only fetch standings for competitions that actually have matches in range
-  const neededCompetitions = [...new Set(matches.map((m) => m.competitionCode))];
-  const statsIndexByCompetition = {};
-
-  for (const code of neededCompetitions) {
+  for (const comp of COMPETITIONS) {
+    let rawMatches;
     try {
-      const standingsData = await getStandings(code, apiKey);
-      statsIndexByCompetition[code] = buildStatsIndex(standingsData);
+      rawMatches = await getRawMatches(comp.code, dateTo, apiKey);
     } catch (e) {
-      errors.push(`Estadísticas ${code}: ${e.message}`);
+      errors.push(`Partidos ${comp.name}: ${e.message}`);
+      continue;
+    }
+
+    const upcoming = rawMatches.filter((m) => {
+      const d = m.utcDate.split("T")[0];
+      return d >= dateFrom && d <= dateTo;
+    });
+    if (upcoming.length === 0) continue;
+
+    let statsIndex = null;
+    try {
+      const standingsData = await getStandings(comp.code, apiKey);
+      statsIndex = buildStatsIndex(standingsData);
+    } catch (e) {
+      errors.push(`Estadísticas ${comp.name}: ${e.message}`);
+    }
+
+    for (const m of upcoming) {
+      const base = {
+        id: m.id,
+        competitionCode: comp.code,
+        competition: comp.name,
+        utcDate: m.utcDate,
+        status: m.status,
+        home: m.homeTeam.name,
+        away: m.awayTeam.name,
+        score: m.score.fullTime,
+      };
+
+      if (!statsIndex) {
+        enriched.push({ ...base, marketsError: "Sin estadísticas disponibles para esta liga todavía." });
+        continue;
+      }
+
+      const homeVenueStats = getTeamVenueStats(statsIndex, m.homeTeam.id, "home");
+      const awayVenueStats = getTeamVenueStats(statsIndex, m.awayTeam.id, "away");
+      if (!homeVenueStats || !awayVenueStats) {
+        enriched.push({ ...base, marketsError: "Alguno de los dos equipos no tiene suficientes partidos jugados aún." });
+        continue;
+      }
+
+      const homeForm = computeForm(rawMatches, m.homeTeam.id, m.utcDate);
+      const awayForm = computeForm(rawMatches, m.awayTeam.id, m.utcDate);
+
+      const homeStats = { ...homeVenueStats, ...homeForm };
+      const awayStats = { ...awayVenueStats, ...awayForm };
+
+      const markets = buildMarkets(m.homeTeam.name, m.awayTeam.name, homeStats, awayStats);
+      enriched.push({ ...base, markets });
     }
   }
 
-  const enriched = matches.map((m) => {
-    const statsIndex = statsIndexByCompetition[m.competitionCode];
-    if (!statsIndex) {
-      return { ...m, marketsError: "Sin estadísticas disponibles para esta liga todavía." };
-    }
-    const homeStats = getTeamVenueStats(statsIndex, m.homeId, "home");
-    const awayStats = getTeamVenueStats(statsIndex, m.awayId, "away");
-    if (!homeStats || !awayStats) {
-      return { ...m, marketsError: "Alguno de los dos equipos no tiene suficientes partidos jugados aún." };
-    }
-    const markets = buildMarkets(m.home, m.away, homeStats, awayStats);
-    return { ...m, markets };
-  });
+  enriched.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
 
   res.status(200).json({ matches: enriched, errors: errors.length ? errors : undefined });
 }
