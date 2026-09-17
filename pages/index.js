@@ -7,6 +7,21 @@ const COLORS = {
   slate: "#5B6660",
 };
 
+const LEAGUE_ORDER = ["Champions League", "Premier League", "La Liga", "Bundesliga", "Serie A"];
+
+function dateKey(utcDate) {
+  return new Date(utcDate).toLocaleDateString("es-MX", { timeZone: "America/Mexico_City" });
+}
+
+function dateHeading(utcDate) {
+  return new Date(utcDate).toLocaleDateString("es-MX", {
+    timeZone: "America/Mexico_City",
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+  });
+}
+
 export default function Home() {
   const [matches, setMatches] = useState(null);
   const [error, setError] = useState(null);
@@ -25,15 +40,20 @@ export default function Home() {
       .catch((e) => setError(e.message));
   }, []);
 
-  // Group matches by competition, preserving a fixed league order
-  const leagueOrder = ["Champions League", "Premier League", "La Liga", "Bundesliga", "Serie A"];
-  const grouped = {};
+  // Group by date first, then by league within each date
+  const byDate = {};
   if (matches) {
     for (const m of matches) {
-      if (!grouped[m.competition]) grouped[m.competition] = [];
-      grouped[m.competition].push(m);
+      const key = dateKey(m.utcDate);
+      if (!byDate[key]) byDate[key] = { heading: dateHeading(m.utcDate), leagues: {} };
+      if (!byDate[key].leagues[m.competition]) byDate[key].leagues[m.competition] = [];
+      byDate[key].leagues[m.competition].push(m);
     }
   }
+  // Sort date groups chronologically
+  const orderedDateKeys = matches
+    ? Object.keys(byDate).sort((a, b) => new Date(byDate[a].leagues[Object.keys(byDate[a].leagues)[0]][0].utcDate) - new Date(byDate[b].leagues[Object.keys(byDate[b].leagues)[0]][0].utcDate))
+    : [];
 
   return (
     <div style={{ minHeight: "100vh", background: COLORS.chalk, color: COLORS.ink, fontFamily: "-apple-system, sans-serif", padding: "28px 20px 60px" }}>
@@ -61,29 +81,37 @@ export default function Home() {
           <p style={{ color: COLORS.slate }}>No hay partidos en los próximos 3 días en ninguna de las ligas conectadas.</p>
         )}
 
-        {matches && matches.length > 0 && leagueOrder.map((league) => {
-          const leagueMatches = grouped[league];
-          if (!leagueMatches || leagueMatches.length === 0) return null;
+        {orderedDateKeys.map((dk) => {
+          const dayData = byDate[dk];
           return (
-            <div key={league} style={{ marginBottom: 28 }}>
-              <h2 style={{ fontFamily: "Georgia, serif", fontSize: 18, color: COLORS.pitch, marginBottom: 10 }}>{league}</h2>
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {leagueMatches.map((m) => (
-                  <div key={m.id} style={{ border: "1px solid #DEDACB", borderRadius: 4, background: "#FFF", padding: "12px 16px" }}>
-                    <div style={{ fontSize: 12, color: COLORS.slate, marginBottom: 4 }}>
-                      {new Date(m.utcDate).toLocaleString("es-MX", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
-                    </div>
-                    <div style={{ fontWeight: 700, fontSize: 15 }}>
-                      {m.home} vs {m.away}
-                    </div>
-                    {m.status === "FINISHED" && (
-                      <div style={{ fontSize: 13, color: COLORS.slate }}>
-                        Resultado: {m.score.home} - {m.score.away}
+            <div key={dk} style={{ marginBottom: 32 }}>
+              <h2 style={{ fontFamily: "Georgia, serif", fontSize: 21, color: COLORS.pitch, borderBottom: `2px solid ${COLORS.pitch}`, paddingBottom: 6, marginBottom: 16, textTransform: "capitalize" }}>
+                {dayData.heading}
+              </h2>
+              {LEAGUE_ORDER.filter((l) => dayData.leagues[l]).map((league) => (
+                <div key={league} style={{ marginBottom: 18 }}>
+                  <h3 style={{ fontSize: 14, fontWeight: 700, color: COLORS.slate, textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: 8 }}>
+                    {league}
+                  </h3>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {dayData.leagues[league].map((m) => (
+                      <div key={m.id} style={{ border: "1px solid #DEDACB", borderRadius: 4, background: "#FFF", padding: "10px 14px" }}>
+                        <div style={{ fontSize: 11.5, color: COLORS.slate, marginBottom: 3 }}>
+                          {new Date(m.utcDate).toLocaleTimeString("es-MX", { timeZone: "America/Mexico_City", hour: "2-digit", minute: "2-digit" })} CDMX
+                        </div>
+                        <div style={{ fontWeight: 700, fontSize: 15 }}>
+                          {m.home} vs {m.away}
+                        </div>
+                        {m.status === "FINISHED" && (
+                          <div style={{ fontSize: 13, color: COLORS.slate }}>
+                            Resultado: {m.score.home} - {m.score.away}
+                          </div>
+                        )}
                       </div>
-                    )}
+                    ))}
                   </div>
-                ))}
-              </div>
+                </div>
+              ))}
             </div>
           );
         })}
